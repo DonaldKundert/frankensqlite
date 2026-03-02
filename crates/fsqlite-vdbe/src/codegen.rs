@@ -2035,6 +2035,8 @@ fn codegen_select_aggregate(
     // Parse aggregate columns: extract function name, arg count, arg column index.
     let agg_columns = parse_aggregate_columns(columns, table)?;
 
+    // Note: in-aggregate ORDER BY (e.g. GROUP_CONCAT(x ORDER BY y)) is not yet supported.
+
     // Allocate one accumulator register per aggregate.
     let accum_base = b.alloc_regs(out_col_count);
 
@@ -2240,6 +2242,329 @@ fn codegen_select_aggregate(
     // Done: Close + Halt.
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End target for Init jump.
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+/// Generate VDBE bytecode for an aggregate SELECT when at least one aggregate
+/// has an in-aggregate ORDER BY clause (SQLite 3.44+).
+///
+/// Two-pass approach:
+/// 1. Scan rows, evaluating ORDER BY sort keys + aggregate arguments + filter
+///    booleans, inserting into a sorter keyed by the ORDER BY columns.
+/// 2. Iterate the sorter in sorted order, calling AggStep for each aggregate.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn codegen_ordered_aggregate(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    agg_columns: &[AggColumn],
+    where_clause: Option<&Expr>,
+    having: Option<&Expr>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    columns: &[ResultColumn],
+) -> Result<(), CodegenError> {
+    let _ = columns; // reserved for future use
+
+    // Collect the ORDER BY terms from the first aggregate that has them.
+    let order_by_terms: &[OrderingTerm] = agg_columns
+        .iter()
+        .find(|a| !a.order_by.is_empty())
+        .map_or(&[], |a| &a.order_by);
+    let num_sort_keys = order_by_terms.len();
+
+    // Layout of sorter record:
+    //   [ORDER BY key cols...] [agg arg slots...] [filter booleans...]
+    let num_agg_arg_slots: usize = agg_columns
+        .iter()
+        .map(|a| {
+            if a.num_args == 0 {
+                0
+            } else {
+                a.num_args.max(1) as usize
+            }
+        })
+        .sum();
+    let num_filters: usize = agg_columns.iter().filter(|a| a.filter.is_some()).count();
+    let total_sorter_cols = num_sort_keys + num_agg_arg_slots + num_filters;
+
+    // Allocate accumulators.
+    let accum_base = b.alloc_regs(out_col_count);
+    for i in 0..out_col_count {
+        b.emit_op(Opcode::Null, 0, accum_base + i, 0, P4::None, 0);
+    }
+
+    // Build sort order string: '+' for ASC, '-' for DESC.
+    let sort_order: String = order_by_terms
+        .iter()
+        .map(|ot| {
+            if matches!(ot.direction, Some(SortDirection::Desc)) {
+                '-'
+            } else {
+                '+'
+            }
+        })
+        .collect();
+
+    // Open sorter.
+    let sorter_cursor = cursor + 1;
+    b.emit_op(
+        Opcode::SorterOpen,
+        sorter_cursor,
+        num_sort_keys as i32,
+        0,
+        P4::Str(sort_order),
+        0,
+    );
+
+    // Open table for reading.
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+
+    // === Pass 1: Scan rows into sorter ===
+    let scan_start = b.current_addr();
+    let scan_done = b.emit_label();
+    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, scan_done, P4::None, 0);
+
+    // WHERE filter.
+    let scan_skip = b.emit_label();
+    if let Some(where_expr) = where_clause {
+        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, scan_skip);
+    }
+
+    // Evaluate sorter record: ORDER BY keys + agg args + filter bools.
+    let sorter_base = b.alloc_regs(total_sorter_cols as i32);
+    {
+        let scan_ctx = ScanCtx {
+            cursor,
+            table,
+            table_alias,
+            schema: Some(schema),
+            register_base: None,
+        };
+        let mut reg = sorter_base;
+
+        // ORDER BY key columns.
+        for ot in order_by_terms {
+            emit_expr(b, &ot.expr, reg, Some(&scan_ctx));
+            reg += 1;
+        }
+
+        // Aggregate arguments.
+        for agg in agg_columns {
+            if agg.num_args == 0 {
+                continue;
+            }
+            // First argument.
+            if agg.arg_is_rowid {
+                b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+            } else if let Some(ref expr) = agg.arg_expr {
+                emit_expr(b, expr, reg, Some(&scan_ctx));
+            } else {
+                let col_idx = agg.arg_col_index.unwrap_or(0);
+                b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+            }
+            reg += 1;
+            // Extra arguments (e.g. separator for group_concat).
+            for extra_expr in &agg.extra_args {
+                emit_expr(b, extra_expr, reg, Some(&scan_ctx));
+                reg += 1;
+            }
+        }
+
+        // FILTER booleans.
+        for agg in agg_columns {
+            if let Some(ref filter_expr) = agg.filter {
+                emit_expr(b, filter_expr, reg, Some(&scan_ctx));
+                reg += 1;
+            }
+        }
+    }
+
+    // MakeRecord + SorterInsert.
+    let record_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        sorter_base,
+        total_sorter_cols as i32,
+        record_reg,
+        P4::None,
+        0,
+    );
+    b.emit_op(
+        Opcode::SorterInsert,
+        sorter_cursor,
+        record_reg,
+        0,
+        P4::None,
+        0,
+    );
+
+    b.resolve_label(scan_skip);
+
+    // Next row in scan.
+    let scan_body = (scan_start + 1) as i32;
+    b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
+
+    // End of pass 1.
+    b.resolve_label(scan_done);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+
+    // === Pass 2: Sort and iterate, calling AggStep ===
+    let sort_done = b.emit_label();
+    b.emit_jump_to_label(Opcode::SorterSort, sorter_cursor, 0, sort_done, P4::None, 0);
+
+    let sort_loop = b.current_addr();
+
+    // Read sorter row into registers.
+    let read_base = b.alloc_regs(total_sorter_cols as i32);
+    b.emit_op(
+        Opcode::SorterData,
+        sorter_cursor,
+        read_base,
+        total_sorter_cols as i32,
+        P4::None,
+        0,
+    );
+
+    // AggStep for each aggregate.
+    let mut agg_arg_offset = num_sort_keys;
+    let mut filter_offset = num_sort_keys + num_agg_arg_slots;
+    for (i, agg) in agg_columns.iter().enumerate() {
+        let accum_reg = accum_base + i as i32;
+
+        // FILTER check: skip AggStep if filter column is false/NULL.
+        let filter_skip_label = if agg.filter.is_some() {
+            let skip_lbl = b.emit_label();
+            let filter_reg = read_base + filter_offset as i32;
+            filter_offset += 1;
+            b.emit_jump_to_label(Opcode::IfNot, filter_reg, 1, skip_lbl, P4::None, 0);
+            Some(skip_lbl)
+        } else {
+            None
+        };
+
+        let distinct_flag = i32::from(agg.distinct);
+        if agg.num_args == 0 {
+            b.emit_op(
+                Opcode::AggStep,
+                distinct_flag,
+                0,
+                accum_reg,
+                P4::FuncName(agg.name.clone()),
+                0,
+            );
+        } else {
+            let arg_base = read_base + agg_arg_offset as i32;
+            agg_arg_offset += agg.num_args.max(1) as usize;
+            let num_args = u16::try_from(agg.num_args).unwrap_or_default();
+            b.emit_op(
+                Opcode::AggStep,
+                distinct_flag,
+                arg_base,
+                accum_reg,
+                P4::FuncName(agg.name.clone()),
+                num_args,
+            );
+        }
+
+        if let Some(skip_lbl) = filter_skip_label {
+            b.resolve_label(skip_lbl);
+        }
+    }
+
+    // SorterNext: loop back.
+    let sort_body = sort_loop as i32;
+    b.emit_op(
+        Opcode::SorterNext,
+        sorter_cursor,
+        sort_body,
+        0,
+        P4::None,
+        0,
+    );
+
+    b.resolve_label(sort_done);
+
+    // AggFinal for each aggregate.
+    for (i, agg) in agg_columns.iter().enumerate() {
+        let accum_reg = accum_base + i as i32;
+        b.emit_op(
+            Opcode::AggFinal,
+            accum_reg,
+            agg.num_args,
+            0,
+            P4::FuncName(agg.name.clone()),
+            0,
+        );
+    }
+
+    // Copy accumulators to output registers.
+    if accum_base != out_regs {
+        for i in 0..out_col_count {
+            b.emit_op(Opcode::Copy, accum_base + i, out_regs + i, 0, P4::None, 0);
+        }
+    }
+
+    // HAVING filter.
+    if let Some(having_expr) = having {
+        let output_cols: Vec<GroupByOutputCol> = (0..agg_columns.len())
+            .map(|i| GroupByOutputCol::Aggregate { agg_index: i })
+            .collect();
+        let skip = b.emit_label();
+        emit_having_check(
+            b,
+            having_expr,
+            &output_cols,
+            agg_columns,
+            &[],
+            table,
+            out_regs,
+            skip,
+        );
+        b.emit_op(
+            Opcode::ResultRow,
+            out_regs,
+            out_col_count,
+            0,
+            P4::None,
+            0,
+        );
+        b.resolve_label(skip);
+    } else {
+        b.emit_op(
+            Opcode::ResultRow,
+            out_regs,
+            out_col_count,
+            0,
+            P4::None,
+            0,
+        );
+    }
+
+    // Done: Close + Halt.
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
     // End target for Init jump.
