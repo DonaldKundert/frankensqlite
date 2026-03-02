@@ -634,11 +634,7 @@ where
             // malformed".  (See issue #8.)
             {
                 let new_page_count = inner.db_size;
-                let new_change_counter = inner
-                    .commit_seq
-                    .get()
-                    .wrapping_add(1)
-                    .min(u64::from(u32::MAX)) as u32;
+                let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
 
                 // Read existing page 1 from disk so we only patch the
                 // relevant header fields.
@@ -694,11 +690,7 @@ where
             // Pre-compute the new db_size so we can patch page 1's header
             // before it enters the WAL.  (See issue #8.)
             let new_db_size = inner.db_size.max(max_written);
-            let new_change_counter = inner
-                .commit_seq
-                .get()
-                .wrapping_add(1)
-                .min(u64::from(u32::MAX)) as u32;
+            let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
 
             for (idx, page_no) in sorted_pages.iter().enumerate() {
                 let data = &write_set[page_no];
@@ -1106,6 +1098,47 @@ where
 
 impl<V: Vfs> traits::sealed::Sealed for SimplePagerCheckpointWriter<V> where V::File: Send + Sync {}
 
+impl<V> SimplePagerCheckpointWriter<V>
+where
+    V: Vfs + Send + Sync,
+    V::File: Send + Sync,
+{
+    /// Patch page 1 header fields that must remain globally consistent.
+    ///
+    /// This ensures external SQLite readers see:
+    /// - a valid change counter (24..28),
+    /// - the true on-disk page count (28..32),
+    /// - matching version-valid-for (92..96).
+    fn patch_page1_header(inner: &mut PagerInner<V::File>, cx: &Cx) -> Result<()> {
+        // SQLite databases always keep page 1 when non-empty.
+        if inner.db_size == 0 {
+            return Ok(());
+        }
+
+        let page_size = inner.page_size.as_usize();
+        let mut page1 = vec![0u8; page_size];
+        let bytes_read = inner.db_file.read(cx, &mut page1, 0)?;
+        if bytes_read < DATABASE_HEADER_SIZE {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "short read while patching page 1 header: got {bytes_read} bytes, need at least {DATABASE_HEADER_SIZE}",
+                ),
+            });
+        }
+
+        let new_page_count = inner.db_size;
+        let seq_plus_one = inner.commit_seq.get().wrapping_add(1);
+        let new_change_counter = seq_plus_one as u32;
+
+        page1[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
+        page1[28..32].copy_from_slice(&new_page_count.to_be_bytes());
+        page1[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
+        inner.db_file.write(cx, &page1, 0)?;
+        inner.cache.evict(PageNumber::ONE);
+        Ok(())
+    }
+}
+
 impl<V> traits::CheckpointPageWriter for SimplePagerCheckpointWriter<V>
 where
     V: Vfs + Send + Sync,
@@ -1125,23 +1158,12 @@ where
         let page_size = inner.page_size.as_usize();
         let offset = u64::from(page_no.get() - 1) * page_size as u64;
 
-        // For page 1, patch the header's page_count (offset 28..32) and
-        // change_counter / version_valid_for so external SQLite readers see a
-        // consistent file.  (See issue #8.)
+        // For page 1, repair header fields after writing the frame bytes.
+        // A final repair also occurs in sync() so page_count remains correct
+        // even when page 1 is checkpointed before higher-numbered pages.
+        inner.db_file.write(cx, data, offset)?;
         if page_no == PageNumber::ONE && data.len() >= DATABASE_HEADER_SIZE {
-            let mut patched = data.to_vec();
-            let new_page_count = inner.db_size;
-            let new_change_counter = inner
-                .commit_seq
-                .get()
-                .wrapping_add(1)
-                .min(u64::from(u32::MAX)) as u32;
-            patched[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
-            patched[28..32].copy_from_slice(&new_page_count.to_be_bytes());
-            patched[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
-            inner.db_file.write(cx, &patched, offset)?;
-        } else {
-            inner.db_file.write(cx, data, offset)?;
+            Self::patch_page1_header(&mut inner, cx)?;
         }
 
         // Invalidate cache entry if present to avoid stale reads.
@@ -1181,6 +1203,9 @@ where
             .inner
             .lock()
             .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
+        // Ensure header page_count reflects the final db_size after all
+        // checkpoint writes/truncation, even if page 1 was checkpointed early.
+        Self::patch_page1_header(&mut inner, cx)?;
         inner.db_file.sync(cx, SyncFlags::NORMAL)
     }
 }
@@ -2668,6 +2693,53 @@ mod tests {
             .checkpoint(&cx, crate::traits::CheckpointMode::Passive)
             .expect_err("checkpoint should be blocked by active writer");
         assert!(matches!(err, FrankenError::Busy));
+    }
+
+    #[test]
+    fn test_checkpoint_writer_sync_repairs_page1_header_after_late_growth() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Snapshot current page 1 as a realistic checkpoint payload.
+        let page1_data = {
+            let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+            txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec()
+        };
+
+        let mut writer = pager.checkpoint_writer();
+
+        // Simulate checkpoint replay order where page 1 arrives first, then a
+        // higher page extends the DB. Without final header repair this can
+        // leave header page_count stale.
+        crate::traits::CheckpointPageWriter::write_page(
+            &mut writer,
+            &cx,
+            PageNumber::ONE,
+            &page1_data,
+        )
+        .unwrap();
+        let page_three = PageNumber::new(3).unwrap();
+        crate::traits::CheckpointPageWriter::write_page(
+            &mut writer,
+            &cx,
+            page_three,
+            &vec![0xAB; ps],
+        )
+        .unwrap();
+        crate::traits::CheckpointPageWriter::sync(&mut writer, &cx).unwrap();
+
+        let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let raw_page1 = txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
+        let header: [u8; DATABASE_HEADER_SIZE] = raw_page1[..DATABASE_HEADER_SIZE]
+            .try_into()
+            .expect("page 1 header must be present");
+        let parsed = DatabaseHeader::from_bytes(&header).expect("header must parse");
+        assert_eq!(
+            parsed.page_count,
+            page_three.get(),
+            "bead_id={BEAD_ID} case=checkpoint_sync_repairs_page_count"
+        );
     }
 
     #[test]
