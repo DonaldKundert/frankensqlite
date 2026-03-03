@@ -2652,10 +2652,8 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                     }
                 };
                 // Build wrapper: replace the aggregate arg with a placeholder.
-                let placeholder = Expr::Column(
-                    ColumnRef::bare("__agg_result__"),
-                    fsqlite_ast::Span::ZERO,
-                );
+                let placeholder =
+                    Expr::Column(ColumnRef::bare("__agg_result__"), fsqlite_ast::Span::ZERO);
                 let mut new_args = outer_args.clone();
                 new_args[i] = placeholder;
                 let wrapper = Expr::FunctionCall {

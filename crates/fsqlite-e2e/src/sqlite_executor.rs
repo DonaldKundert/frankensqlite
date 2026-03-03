@@ -655,13 +655,18 @@ fn classify_rusqlite_error_as_op(err: &rusqlite::Error) -> OpError {
 }
 
 fn backoff_duration(config: &SqliteExecConfig, attempt: u32) -> Duration {
-    // Exponential backoff with cap.
+    // Exponential backoff with cap.  Uses microsecond granularity so that
+    // sub-millisecond base backoffs (e.g. 200µs) are not truncated to zero.
     let shift = attempt.min(31);
-    let base_ms = duration_to_u64_ms(config.busy_backoff);
-    let max_ms = duration_to_u64_ms(config.busy_backoff_max);
-    let factor_ms = 1_u64 << shift;
-    let raw = base_ms.saturating_mul(factor_ms);
-    Duration::from_millis(raw.min(max_ms))
+    let base_us = duration_to_u64_us(config.busy_backoff);
+    let max_us = duration_to_u64_us(config.busy_backoff_max);
+    let factor = 1_u64 << shift;
+    let raw = base_us.saturating_mul(factor);
+    Duration::from_micros(raw.min(max_us))
+}
+
+fn duration_to_u64_us(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn duration_to_u64_ms(d: Duration) -> u64 {
@@ -829,5 +834,36 @@ mod tests {
         let report = run_oplog_sqlite(&db_path, &oplog, &SqliteExecConfig::default()).unwrap();
         assert!(report.error.is_none(), "error={:?}", report.error);
         assert_eq!(report.ops_total, 1);
+    }
+
+    #[test]
+    fn backoff_duration_sub_millisecond_base() {
+        let config = SqliteExecConfig {
+            busy_backoff: Duration::from_micros(200),
+            busy_backoff_max: Duration::from_millis(2),
+            ..SqliteExecConfig::default()
+        };
+        // Attempt 1: 200µs * 2 = 400µs
+        let d1 = backoff_duration(&config, 1);
+        assert_eq!(d1, Duration::from_micros(400));
+        // Attempt 3: 200µs * 8 = 1600µs
+        let d3 = backoff_duration(&config, 3);
+        assert_eq!(d3, Duration::from_micros(1600));
+        // Attempt 4: 200µs * 16 = 3200µs → capped at 2000µs
+        let d4 = backoff_duration(&config, 4);
+        assert_eq!(d4, Duration::from_millis(2));
+    }
+
+    #[test]
+    fn backoff_duration_millisecond_base() {
+        let config = SqliteExecConfig::default();
+        // Default: base=1ms, max=250ms
+        let d0 = backoff_duration(&config, 0);
+        assert_eq!(d0, Duration::from_millis(1));
+        let d1 = backoff_duration(&config, 1);
+        assert_eq!(d1, Duration::from_millis(2));
+        // Attempt 8: 1ms * 256 = 256ms → capped at 250ms
+        let d8 = backoff_duration(&config, 8);
+        assert_eq!(d8, Duration::from_millis(250));
     }
 }

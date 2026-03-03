@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use asupersync::types::{CancelKind as NativeCancelKind, CancelReason as NativeCancelReason};
 use asupersync::Cx as NativeCx;
+use asupersync::types::{CancelKind as NativeCancelKind, CancelReason as NativeCancelReason};
 
 use crate::eprocess::EProcessOracle;
 
@@ -1249,7 +1249,9 @@ mod tests {
         cx.set_native_cx(native.clone());
 
         cx.cancel_with_reason(CancelReason::RegionClose);
-        let reason = native.cancel_reason().expect("native cancel reason must be set");
+        let reason = native
+            .cancel_reason()
+            .expect("native cancel reason must be set");
         assert_eq!(reason.kind, NativeCancelKind::ParentCancelled);
     }
 

@@ -124,6 +124,9 @@ pub enum PagerBackend {
     /// Unix filesystem VFS backend (file-backed databases on all unix platforms).
     #[cfg(unix)]
     Unix(Arc<SimplePager<UnixVfs>>),
+    /// Windows filesystem VFS backend (file-backed databases on Windows).
+    #[cfg(target_os = "windows")]
+    Windows(Arc<SimplePager<fsqlite_vfs::WindowsVfs>>),
 }
 
 impl std::fmt::Debug for PagerBackend {
@@ -134,6 +137,8 @@ impl std::fmt::Debug for PagerBackend {
             Self::IoUring(_) => f.write_str("PagerBackend::IoUring"),
             #[cfg(unix)]
             Self::Unix(_) => f.write_str("PagerBackend::Unix"),
+            #[cfg(target_os = "windows")]
+            Self::Windows(_) => f.write_str("PagerBackend::Windows"),
         }
     }
 }
@@ -154,6 +159,8 @@ impl PagerBackend {
             Self::IoUring(_) => true,
             #[cfg(unix)]
             Self::Unix(_) => true,
+            #[cfg(target_os = "windows")]
+            Self::Windows(_) => true,
         }
     }
 
@@ -166,6 +173,8 @@ impl PagerBackend {
             Self::IoUring(_) => "iouring",
             #[cfg(unix)]
             Self::Unix(_) => "unix",
+            #[cfg(target_os = "windows")]
+            Self::Windows(_) => "windows",
         }
     }
 
@@ -196,7 +205,14 @@ impl PagerBackend {
                 let pager = SimplePager::open(vfs, &db_path, PageSize::DEFAULT)?;
                 Ok(Self::Unix(Arc::new(pager)))
             }
-            #[cfg(not(unix))]
+            #[cfg(target_os = "windows")]
+            {
+                let vfs = fsqlite_vfs::WindowsVfs::new();
+                let db_path = PathBuf::from(path);
+                let pager = SimplePager::open(vfs, &db_path, PageSize::DEFAULT)?;
+                Ok(Self::Windows(Arc::new(pager)))
+            }
+            #[cfg(not(any(unix, target_os = "windows")))]
             {
                 Err(FrankenError::NotImplemented(
                     "file-backed pager not available on this platform".to_owned(),
@@ -213,6 +229,8 @@ impl PagerBackend {
             Self::IoUring(p) => Ok(Box::new(p.begin(cx, mode)?)),
             #[cfg(unix)]
             Self::Unix(p) => Ok(Box::new(p.begin(cx, mode)?)),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => Ok(Box::new(p.begin(cx, mode)?)),
         }
     }
 
@@ -223,6 +241,8 @@ impl PagerBackend {
             Self::IoUring(p) => p.journal_mode(),
             #[cfg(unix)]
             Self::Unix(p) => p.journal_mode(),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.journal_mode(),
         }
     }
 
@@ -233,6 +253,8 @@ impl PagerBackend {
             Self::IoUring(p) => p.set_journal_mode(cx, mode),
             #[cfg(unix)]
             Self::Unix(p) => p.set_journal_mode(cx, mode),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.set_journal_mode(cx, mode),
         }
     }
 
@@ -253,6 +275,11 @@ impl PagerBackend {
                 let vfs = UnixVfs::new();
                 install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
             }
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => {
+                let vfs = fsqlite_vfs::WindowsVfs::new();
+                install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+            }
         }
     }
 
@@ -268,6 +295,8 @@ impl PagerBackend {
             Self::IoUring(p) => p.checkpoint(cx, mode),
             #[cfg(unix)]
             Self::Unix(p) => p.checkpoint(cx, mode),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.checkpoint(cx, mode),
         }
     }
 
@@ -279,6 +308,8 @@ impl PagerBackend {
             Self::IoUring(p) => p.cache_metrics_snapshot(),
             #[cfg(unix)]
             Self::Unix(p) => p.cache_metrics_snapshot(),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.cache_metrics_snapshot(),
         }
     }
 
@@ -290,6 +321,8 @@ impl PagerBackend {
             Self::IoUring(p) => p.reset_cache_metrics(),
             #[cfg(unix)]
             Self::Unix(p) => p.reset_cache_metrics(),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.reset_cache_metrics(),
         }
     }
 }
@@ -32264,7 +32297,8 @@ mod pager_routing_tests {
     fn test_coalesce_aggregate_empty_table() {
         // COALESCE with aggregate on empty table should return fallback.
         let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE empty_tbl (val INTEGER);").unwrap();
+        conn.execute("CREATE TABLE empty_tbl (val INTEGER);")
+            .unwrap();
 
         let rows = conn
             .query("SELECT COALESCE(MAX(val), 0) FROM empty_tbl;")
@@ -32295,9 +32329,7 @@ mod pager_routing_tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE ifn (val INTEGER);").unwrap();
 
-        let rows = conn
-            .query("SELECT IFNULL(SUM(val), -1) FROM ifn;")
-            .unwrap();
+        let rows = conn.query("SELECT IFNULL(SUM(val), -1) FROM ifn;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(-1));
     }
@@ -34280,14 +34312,9 @@ mod pager_routing_tests {
         )
         .unwrap();
 
-        let rows = conn
-            .query("SELECT name FROM prep_dml ORDER BY id")
-            .unwrap();
+        let rows = conn.query("SELECT name FROM prep_dml ORDER BY id").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("Alice".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
         assert_eq!(rows[1].values()[0], SqliteValue::Text("Bob".to_owned()));
     }
 
@@ -34312,9 +34339,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(affected, 1);
 
-        let rows = conn
-            .query("SELECT val FROM prep_upd WHERE id = 1")
-            .unwrap();
+        let rows = conn.query("SELECT val FROM prep_upd WHERE id = 1").unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Text("new".to_owned()));
     }
 
@@ -34326,9 +34351,7 @@ mod pager_routing_tests {
         conn.execute("INSERT INTO prep_del VALUES (1, 'a'), (2, 'b'), (3, 'c');")
             .unwrap();
 
-        let stmt = conn
-            .prepare("DELETE FROM prep_del WHERE id = ?1")
-            .unwrap();
+        let stmt = conn.prepare("DELETE FROM prep_del WHERE id = ?1").unwrap();
         assert!(stmt.is_dml());
 
         let affected = conn
@@ -34347,9 +34370,7 @@ mod pager_routing_tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE prep_err (id INTEGER PRIMARY KEY);")
             .unwrap();
-        let stmt = conn
-            .prepare("INSERT INTO prep_err VALUES (?1)")
-            .unwrap();
+        let stmt = conn.prepare("INSERT INTO prep_err VALUES (?1)").unwrap();
         // Standalone query() should error for DML.
         assert!(stmt.query().is_err());
     }

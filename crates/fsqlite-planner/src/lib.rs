@@ -3306,9 +3306,8 @@ pub fn pushdown_predicates<'a>(
             // No table qualifiers (unqualified columns or pure literals in the RHS).
             if let Some(ref col) = term.column {
                 if let Some(ref tname) = col.table {
-                    if let Some(matched) = table_names
-                        .iter()
-                        .find(|t| t.eq_ignore_ascii_case(tname))
+                    if let Some(matched) =
+                        table_names.iter().find(|t| t.eq_ignore_ascii_case(tname))
                     {
                         pushed.push(PushedPredicate {
                             table: matched.clone(),
@@ -6938,12 +6937,42 @@ mod tests {
 #[test]
 fn debug_test_join_order() {
     let tables = vec![
-        TableStats { name: "nation".to_owned(), n_pages: 1, n_rows: 25, source: StatsSource::Analyze },
-        TableStats { name: "region".to_owned(), n_pages: 1, n_rows: 5, source: StatsSource::Analyze },
-        TableStats { name: "supplier".to_owned(), n_pages: 100, n_rows: 10_000, source: StatsSource::Analyze },
-        TableStats { name: "customer".to_owned(), n_pages: 500, n_rows: 150_000, source: StatsSource::Analyze },
-        TableStats { name: "orders".to_owned(), n_pages: 2000, n_rows: 1_500_000, source: StatsSource::Analyze },
-        TableStats { name: "lineitem".to_owned(), n_pages: 8000, n_rows: 6_000_000, source: StatsSource::Analyze },
+        TableStats {
+            name: "nation".to_owned(),
+            n_pages: 1,
+            n_rows: 25,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "region".to_owned(),
+            n_pages: 1,
+            n_rows: 5,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "supplier".to_owned(),
+            n_pages: 100,
+            n_rows: 10_000,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "customer".to_owned(),
+            n_pages: 500,
+            n_rows: 150_000,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "orders".to_owned(),
+            n_pages: 2000,
+            n_rows: 1_500_000,
+            source: StatsSource::Analyze,
+        },
+        TableStats {
+            name: "lineitem".to_owned(),
+            n_pages: 8000,
+            n_rows: 6_000_000,
+            source: StatsSource::Analyze,
+        },
     ];
     let plan = order_joins(&tables, &[], &[], None, &[]);
     println!("Join order: {:?}", plan.join_order);
