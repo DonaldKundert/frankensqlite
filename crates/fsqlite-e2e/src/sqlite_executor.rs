@@ -105,7 +105,7 @@ pub fn run_oplog_sqlite(
     // Run setup SQL on a single connection first.
     if setup_len > 0 {
         let setup_conn = Connection::open(db_path)?;
-        apply_pragmas(&setup_conn, &config.pragmas)?;
+        apply_pragmas(&setup_conn, config)?;
         for rec in &oplog.records[..setup_len] {
             if let OpKind::Sql { statement } = &rec.kind {
                 setup_conn.execute_batch(statement)?;
@@ -247,12 +247,14 @@ fn run_worker(
         Ok(c) => c,
         Err(e) => {
             stats.error = Some(format!("worker {worker_id} open failed: {e}"));
+            barrier.wait();
             return stats;
         }
     };
 
-    if let Err(e) = apply_pragmas(&conn, &config.pragmas) {
+    if let Err(e) = apply_pragmas(&conn, config) {
         stats.error = Some(format!("worker {worker_id} pragmas failed: {e}"));
+        barrier.wait();
         return stats;
     }
 
@@ -298,9 +300,22 @@ fn run_worker(
     stats
 }
 
-fn apply_pragmas(conn: &Connection, pragmas: &[String]) -> Result<(), rusqlite::Error> {
-    for p in pragmas {
-        conn.execute_batch(p)?;
+fn apply_pragmas(conn: &Connection, config: &SqliteExecConfig) -> Result<(), rusqlite::Error> {
+    for p in &config.pragmas {
+        let mut attempt = 0;
+        loop {
+            match conn.execute_batch(p) {
+                Ok(()) => break,
+                Err(rusqlite::Error::SqliteFailure(err, msg)) if err.code == rusqlite::ErrorCode::DatabaseBusy => {
+                    attempt += 1;
+                    if attempt > config.max_busy_retries {
+                        return Err(rusqlite::Error::SqliteFailure(err, msg));
+                    }
+                    std::thread::sleep(backoff_duration(config, attempt));
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
     Ok(())
 }

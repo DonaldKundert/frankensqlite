@@ -136,12 +136,22 @@ fn configure_connection(conn: &Connection, config: &FsqliteExecConfig) -> E2eRes
     // override it if needed.
     let concurrent_mode = if config.concurrent_mode { "ON" } else { "OFF" };
     let concurrent_pragma = format!("PRAGMA fsqlite.concurrent_mode={concurrent_mode};");
-    conn.execute(&concurrent_pragma)
-        .map_err(|e| E2eError::Fsqlite(format!("{concurrent_pragma}: {e}")))?;
 
-    for pragma in &config.pragmas {
-        conn.execute(pragma)
-            .map_err(|e| E2eError::Fsqlite(format!("pragma `{pragma}`: {e}")))?;
+    for pragma in std::iter::once(&concurrent_pragma).chain(config.pragmas.iter()) {
+        let mut attempt = 0;
+        loop {
+            match conn.execute(pragma) {
+                Ok(_) => break,
+                Err(fsqlite_error::FrankenError::Busy | fsqlite_error::FrankenError::BusyRecovery) => {
+                    attempt += 1;
+                    if attempt > 100 {
+                        return Err(E2eError::Fsqlite(format!("pragma `{pragma}`: database is busy")));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => return Err(E2eError::Fsqlite(format!("pragma `{pragma}`: {e}"))),
+            }
+        }
     }
     Ok(())
 }
@@ -290,6 +300,7 @@ fn run_worker_parallel(
     let conn = match open_connection(db_path) {
         Ok(conn) => conn,
         Err(e) => {
+            barrier.wait();
             return WorkerStats {
                 first_error: Some(format!("worker {worker_id} open failed: {e}")),
                 ..WorkerStats::default()
@@ -297,6 +308,7 @@ fn run_worker_parallel(
         }
     };
     if let Err(e) = configure_connection(&conn, config) {
+        barrier.wait();
         return WorkerStats {
             first_error: Some(format!("worker {worker_id} config failed: {e}")),
             ..WorkerStats::default()
