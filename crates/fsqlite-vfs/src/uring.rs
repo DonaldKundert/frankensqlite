@@ -616,6 +616,8 @@ impl VfsFile for IoUringFile {
                     record_io_uring_unix_fallback();
                 }
             }
+        } else {
+            record_io_uring_unix_fallback();
         }
         self.inner.read(cx, buf, offset)
     }
@@ -643,6 +645,8 @@ impl VfsFile for IoUringFile {
                     record_io_uring_unix_fallback();
                 }
             }
+        } else {
+            record_io_uring_unix_fallback();
         }
         self.inner.write(cx, buf, offset)
     }
@@ -763,6 +767,33 @@ mod tests {
                 "read path should either record io_uring latency or fallback"
             );
         }
+    }
+
+    #[test]
+    fn test_disabled_runtime_records_unix_fallback_metrics() {
+        reset_io_uring_latency_metrics();
+
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        vfs.runtime.disable("test disable before io");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("uring_disabled_runtime_metrics.db");
+
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open should succeed via unix fallback");
+        file.write(&cx, b"fallback-metrics", 0)
+            .expect("write should succeed via unix path");
+        let mut buf = [0_u8; 16];
+        let _ = file
+            .read(&cx, &mut buf, 0)
+            .expect("read should succeed via unix path");
+
+        let snapshot = io_uring_latency_snapshot();
+        assert!(
+            snapshot.unix_fallbacks_total >= 2,
+            "disabled runtime should record fallback for both write/read ops"
+        );
     }
 
     #[test]

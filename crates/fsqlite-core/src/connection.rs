@@ -57,6 +57,8 @@ use fsqlite_vdbe::engine::{
     vdbe_jit_cache_capacity, vdbe_jit_enabled, vdbe_jit_hot_threshold, vdbe_jit_metrics_snapshot,
 };
 use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
+#[cfg(target_os = "linux")]
+use fsqlite_vfs::IoUringVfs;
 use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
 use fsqlite_vfs::UnixVfs;
@@ -116,6 +118,9 @@ const MAX_TRIGGER_DEPTH: usize = 100;
 pub enum PagerBackend {
     /// In-memory VFS backend (`:memory:` databases).
     Memory(Arc<SimplePager<MemoryVfs>>),
+    /// Linux io_uring VFS backend (file-backed databases on Linux).
+    #[cfg(target_os = "linux")]
+    IoUring(Arc<SimplePager<IoUringVfs>>),
     /// Unix filesystem VFS backend (file-backed databases on all unix platforms).
     #[cfg(unix)]
     Unix(Arc<SimplePager<UnixVfs>>),
@@ -125,6 +130,8 @@ impl std::fmt::Debug for PagerBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Memory(_) => f.write_str("PagerBackend::Memory"),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(_) => f.write_str("PagerBackend::IoUring"),
             #[cfg(unix)]
             Self::Unix(_) => f.write_str("PagerBackend::Unix"),
         }
@@ -143,6 +150,8 @@ impl PagerBackend {
     pub fn is_file_backed(&self) -> bool {
         match self {
             Self::Memory(_) => false,
+            #[cfg(target_os = "linux")]
+            Self::IoUring(_) => true,
             #[cfg(unix)]
             Self::Unix(_) => true,
         }
@@ -153,6 +162,8 @@ impl PagerBackend {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::Memory(_) => "memory",
+            #[cfg(target_os = "linux")]
+            Self::IoUring(_) => "iouring",
             #[cfg(unix)]
             Self::Unix(_) => "unix",
         }
@@ -162,7 +173,8 @@ impl PagerBackend {
     ///
     /// Uses [`MemoryVfs`] for `:memory:`.
     ///
-    /// File-backed paths use [`UnixVfs`] on all unix platforms.
+    /// File-backed paths use [`IoUringVfs`] on Linux and [`UnixVfs`] on
+    /// other unix platforms.
     fn open(path: &str) -> Result<Self> {
         if path == ":memory:" {
             let vfs = MemoryVfs::new();
@@ -170,7 +182,14 @@ impl PagerBackend {
             let pager = SimplePager::open(vfs, &db_path, PageSize::DEFAULT)?;
             Ok(Self::Memory(Arc::new(pager)))
         } else {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
+            {
+                let vfs = IoUringVfs::new();
+                let db_path = PathBuf::from(path);
+                let pager = SimplePager::open(vfs, &db_path, PageSize::DEFAULT)?;
+                Ok(Self::IoUring(Arc::new(pager)))
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
             {
                 let vfs = UnixVfs::new();
                 let db_path = PathBuf::from(path);
@@ -190,6 +209,8 @@ impl PagerBackend {
     fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Box<dyn TransactionHandle>> {
         match self {
             Self::Memory(p) => Ok(Box::new(p.begin(cx, mode)?)),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => Ok(Box::new(p.begin(cx, mode)?)),
             #[cfg(unix)]
             Self::Unix(p) => Ok(Box::new(p.begin(cx, mode)?)),
         }
@@ -198,6 +219,8 @@ impl PagerBackend {
     fn journal_mode(&self) -> JournalMode {
         match self {
             Self::Memory(p) => p.journal_mode(),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.journal_mode(),
             #[cfg(unix)]
             Self::Unix(p) => p.journal_mode(),
         }
@@ -206,6 +229,8 @@ impl PagerBackend {
     fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
         match self {
             Self::Memory(p) => p.set_journal_mode(cx, mode),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.set_journal_mode(cx, mode),
             #[cfg(unix)]
             Self::Unix(p) => p.set_journal_mode(cx, mode),
         }
@@ -216,6 +241,11 @@ impl PagerBackend {
         match self {
             Self::Memory(p) => {
                 let vfs = MemoryVfs::new();
+                install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+            }
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => {
+                let vfs = IoUringVfs::new();
                 install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
             }
             #[cfg(unix)]
@@ -234,6 +264,8 @@ impl PagerBackend {
     ) -> Result<fsqlite_pager::CheckpointResult> {
         match self {
             Self::Memory(p) => p.checkpoint(cx, mode),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.checkpoint(cx, mode),
             #[cfg(unix)]
             Self::Unix(p) => p.checkpoint(cx, mode),
         }
@@ -243,6 +275,8 @@ impl PagerBackend {
     fn cache_metrics_snapshot(&self) -> Result<PageCacheMetricsSnapshot> {
         match self {
             Self::Memory(p) => p.cache_metrics_snapshot(),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.cache_metrics_snapshot(),
             #[cfg(unix)]
             Self::Unix(p) => p.cache_metrics_snapshot(),
         }
@@ -252,6 +286,8 @@ impl PagerBackend {
     fn reset_cache_metrics(&self) -> Result<()> {
         match self {
             Self::Memory(p) => p.reset_cache_metrics(),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.reset_cache_metrics(),
             #[cfg(unix)]
             Self::Unix(p) => p.reset_cache_metrics(),
         }
@@ -1334,7 +1370,7 @@ impl Connection {
         Ok(())
     }
 
-    /// Returns the kind of pager backend in use (e.g. "memory" or "unix").
+    /// Returns the kind of pager backend in use (e.g. "memory", "iouring", or "unix").
     #[must_use]
     pub fn pager_backend_kind(&self) -> &'static str {
         self.pager.kind_str()
@@ -16893,7 +16929,17 @@ mod tests {
         assert!(matches!(conn.pager, PagerBackend::Memory(_)));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_file_backed_connection_uses_iouring_pager_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pager_backend_iouring.db");
+        let path_str = path.to_string_lossy().into_owned();
+        let conn = Connection::open(path_str).unwrap();
+        assert!(matches!(conn.pager, PagerBackend::IoUring(_)));
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn test_file_backed_connection_uses_unix_pager_backend() {
         let dir = tempfile::tempdir().unwrap();
@@ -28296,7 +28342,16 @@ mod pager_routing_tests {
         assert_eq!(conn.pager_backend_kind(), "memory");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pager_backend_kind_iouring() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("kind_test.db");
+        let conn = Connection::open(db_path.to_str().unwrap()).expect("open db");
+        assert_eq!(conn.pager_backend_kind(), "iouring");
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn test_pager_backend_kind_unix() {
         let dir = tempfile::tempdir().unwrap();
@@ -29783,9 +29838,16 @@ mod pager_routing_tests {
             .to_string();
         let file_conn = Connection::open(&path).unwrap();
         let file_rows = file_conn.query("PRAGMA fsqlite.backend_kind;").unwrap();
+        let expected_file_kind = if cfg!(target_os = "linux") {
+            "iouring"
+        } else if cfg!(unix) {
+            "unix"
+        } else {
+            "memory"
+        };
         assert_eq!(
             file_rows[0].values()[0],
-            SqliteValue::Text("unix".to_owned())
+            SqliteValue::Text(expected_file_kind.to_owned())
         );
     }
 
@@ -30052,7 +30114,14 @@ mod pager_routing_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("z1_kind.db").to_string_lossy().to_string();
         let file_conn = Connection::open(&path).unwrap();
-        assert_eq!(file_conn.pager_backend_kind(), "unix");
+        let expected_file_kind = if cfg!(target_os = "linux") {
+            "iouring"
+        } else if cfg!(unix) {
+            "unix"
+        } else {
+            "memory"
+        };
+        assert_eq!(file_conn.pager_backend_kind(), expected_file_kind);
     }
 
     #[test]
@@ -32922,7 +32991,8 @@ mod pager_routing_tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE pc2 (id INTEGER PRIMARY KEY, x TEXT);")
             .unwrap();
-        conn.execute("INSERT INTO pc2 VALUES (1, 'before');").unwrap();
+        conn.execute("INSERT INTO pc2 VALUES (1, 'before');")
+            .unwrap();
 
         // Populate cache.
         let rows = conn.query("SELECT x FROM pc2 WHERE id = 1").unwrap();
